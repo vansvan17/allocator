@@ -1,9 +1,4 @@
 // test_allocator.cpp — Functional and performance smoke tests.
-//
-// Compile:
-//   g++ -O2 -std=c++17 -Wall -Wextra test_allocator.cpp -o test_alloc
-// Run:
-//   ./test_alloc
 
 #include "arena_allocator.hpp"
 
@@ -29,7 +24,6 @@ static void test_basic_alloc_free() {
     Allocator a;
     void* p = a.allocate(64);
     EXPECT(p != nullptr);
-    // Writability check: write the whole region.
     std::memset(p, 0xAB, 64);
     a.deallocate(p);
 }
@@ -56,7 +50,6 @@ static void test_many_allocs_no_corruption() {
         std::memset(p, static_cast<int>(i & 0xFF), n);
         live.push_back({p, n});
     }
-    // Verify no allocation overwrote another.
     for (size_t i = 0; i < live.size(); ++i) {
         auto [p, n] = live[i];
         for (size_t j = 0; j < n; ++j) {
@@ -70,16 +63,12 @@ static void test_many_allocs_no_corruption() {
 static void test_coalescing() {
     std::fprintf(stderr, "[ RUN ] coalescing\n");
     Allocator a;
-    // Allocate three adjacent blocks, free middle then right then left.
-    // After all three frees, the arena should be a single free block again,
-    // so a subsequent giant allocation should succeed.
     void* p1 = a.allocate(256);
     void* p2 = a.allocate(256);
     void* p3 = a.allocate(256);
     a.deallocate(p2);
     a.deallocate(p3);
     a.deallocate(p1);
-    // Try to allocate something larger than any single block we just freed.
     void* big = a.allocate(700);
     EXPECT(big != nullptr);
     a.deallocate(big);
@@ -87,7 +76,7 @@ static void test_coalescing() {
 
 static void test_arena_growth() {
     std::fprintf(stderr, "[ RUN ] arena_growth\n");
-    Allocator a(4096);   // tiny arena to force growth
+    Allocator a(4096);
     std::vector<void*> ptrs;
     for (int i = 0; i < 100; ++i) {
         void* p = a.allocate(1024);
@@ -98,12 +87,68 @@ static void test_arena_growth() {
     for (auto* p : ptrs) a.deallocate(p);
 }
 
+static void test_realloc() {
+    std::fprintf(stderr, "[ RUN ] realloc\n");
+    Allocator a;
+    void* p = a.allocate(32);
+    EXPECT(p != nullptr);
+    std::memcpy(p, "hello arena", 12);
+
+    p = a.realloc(p, 1024);
+    EXPECT(p != nullptr);
+    EXPECT(std::memcmp(p, "hello arena", 12) == 0);
+
+    void* z = a.realloc(nullptr, 64);
+    EXPECT(z != nullptr);
+
+    void* shrink = a.realloc(z, 8);
+    EXPECT(shrink == z);
+
+    a.deallocate(shrink);
+    EXPECT(a.deallocate(nullptr); (void)0;);
+}
+
+static void test_usable_size() {
+    std::fprintf(stderr, "[ RUN ] usable_size\n");
+    Allocator a;
+    void* p = a.allocate(100);
+    EXPECT(p != nullptr);
+    EXPECT(a.usable_size(p) >= 100);
+    a.deallocate(p);
+    EXPECT(a.usable_size(nullptr) == 0);
+}
+
+static void test_stats() {
+    std::fprintf(stderr, "[ RUN ] stats\n");
+    Allocator a;
+    auto s0 = a.stats();
+    EXPECT(s0.arena_count >= 1);
+    EXPECT(s0.total_mapped > 0);
+
+    void* p = a.allocate(128);
+    EXPECT(p != nullptr);
+    auto s1 = a.stats();
+    EXPECT(s1.allocation_count >= 1);
+
+    a.deallocate(p);
+}
+
+static void test_deallocate_all() {
+    std::fprintf(stderr, "[ RUN ] deallocate_all\n");
+    Allocator a;
+    std::vector<void*> ptrs;
+    for (int i = 0; i < 100; ++i) ptrs.push_back(a.allocate(64));
+    a.deallocate_all();
+    void* big = a.allocate(1024 * 512);
+    EXPECT(big != nullptr);
+    a.deallocate(big);
+}
+
 static void benchmark() {
     std::fprintf(stderr, "\n[ BENCH ] alloc/free hot loop, fixed 64B, 2M iters\n");
     constexpr int N = 2'000'000;
     using clk = std::chrono::steady_clock;
 
-    // Arena
     {
         Allocator a;
         auto t0 = clk::now();
@@ -116,7 +161,6 @@ static void benchmark() {
         std::fprintf(stderr, "  arena : %lld ns total, %.1f ns/op\n",
                      static_cast<long long>(dt), double(dt) / N);
     }
-    // malloc
     {
         auto t0 = clk::now();
         for (int i = 0; i < N; ++i) {
@@ -136,6 +180,10 @@ int main() {
     test_many_allocs_no_corruption();
     test_coalescing();
     test_arena_growth();
+    test_realloc();
+    test_usable_size();
+    test_stats();
+    test_deallocate_all();
 
     std::fprintf(stderr, "\n%s\n", failures == 0 ? "all tests passed" : "TESTS FAILED");
 
