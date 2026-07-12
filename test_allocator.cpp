@@ -105,7 +105,10 @@ static void test_realloc() {
     EXPECT(shrink == z);
 
     a.deallocate(shrink);
-    EXPECT(a.deallocate(nullptr); (void)0;);
+    // deallocate(nullptr) is required to be a no-op.  It returns void, so
+    // calling it directly is the only meaningful assertion here: the test
+    // passes if it does not crash.
+    a.deallocate(nullptr);
 }
 
 static void test_usable_size() {

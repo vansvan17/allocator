@@ -201,7 +201,6 @@ public:
 
     AllocatorStats stats() const {
         AllocatorStats s;
-        size_t used = 0;
         for (Arena* a = arenas_; a; a = a->next) {
             ++s.arena_count;
             s.total_mapped += a->size;
