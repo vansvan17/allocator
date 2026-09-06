@@ -3,14 +3,21 @@
 #include "arena_allocator.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 using arena::Allocator;
+using arena::ConcurrentAllocator;
 
 static int failures = 0;
+
+static inline void keep_pointer_observable(void* p) {
+    asm volatile("" : : "g"(p) : "memory");
+}
 
 #define EXPECT(cond) do {                                                 \
     if (!(cond)) {                                                        \
@@ -147,6 +154,121 @@ static void test_deallocate_all() {
     a.deallocate(big);
 }
 
+static void test_concurrent_cross_thread_free() {
+    std::fprintf(stderr, "[ RUN ] concurrent_cross_thread_free\n");
+    constexpr int kThreads = 16;
+    constexpr int kItems = 512;
+    ConcurrentAllocator allocator;
+    std::vector<std::vector<void*>> blocks(kThreads);
+    std::vector<std::vector<size_t>> sizes(kThreads);
+    std::atomic<bool> contents_ok{true};
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            blocks[t].reserve(kItems);
+            sizes[t].reserve(kItems);
+            for (int i = 0; i < kItems; ++i) {
+                const size_t size = 16 + ((t * 37 + i * 19) % 240);
+                void* p = allocator.allocate(size);
+                EXPECT(p != nullptr);
+                std::memset(p, t, size);
+                blocks[t].push_back(p);
+                sizes[t].push_back(size);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    threads.clear();
+
+    // Each thread frees blocks created by a different thread.
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            const int source = (t + 1) % kThreads;
+            for (int i = 0; i < kItems; ++i) {
+                auto* p = static_cast<unsigned char*>(blocks[source][i]);
+                for (size_t j = 0; j < sizes[source][i]; ++j) {
+                    if (p[j] != static_cast<unsigned char>(source)) {
+                        contents_ok.store(false, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+                allocator.deallocate(p);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    EXPECT(contents_ok.load(std::memory_order_relaxed));
+}
+
+static void test_concurrent_realloc() {
+    std::fprintf(stderr, "[ RUN ] concurrent_realloc\n");
+    ConcurrentAllocator allocator;
+    auto* original = static_cast<unsigned char*>(allocator.allocate(64));
+    std::memset(original, 0x5a, 64);
+    void* resized = nullptr;
+    std::thread thread([&] { resized = allocator.realloc(original, 4096); });
+    thread.join();
+    EXPECT(resized != nullptr);
+    auto* bytes = static_cast<unsigned char*>(resized);
+    for (int i = 0; i < 64; ++i) EXPECT(bytes[i] == 0x5a);
+    allocator.deallocate(resized);
+}
+
+static void benchmark_concurrent() {
+    std::fprintf(stderr,
+                 "\n[ BENCH ] 16-thread alloc/free, fixed 64B, 500k pairs/thread\n");
+    constexpr int kThreads = 16;
+    constexpr int kPairsPerThread = 500'000;
+    ConcurrentAllocator allocator;
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<std::uintptr_t> checksum{0};
+    std::vector<std::thread> threads;
+    std::vector<long long> thread_ns(kThreads);
+
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            // Warm the thread's shard before starting the clock.
+            void* warmup = allocator.allocate(64);
+            allocator.deallocate(warmup);
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {}
+
+            const auto thread_start = std::chrono::steady_clock::now();
+            std::uintptr_t local = 0;
+            for (int i = 0; i < kPairsPerThread; ++i) {
+                void* p = allocator.allocate(64);
+                keep_pointer_observable(p);
+                static_cast<unsigned char*>(p)[0] =
+                    static_cast<unsigned char>(i);
+                local ^= reinterpret_cast<std::uintptr_t>(p);
+                allocator.deallocate(p);
+            }
+            thread_ns[t] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - thread_start).count();
+            checksum.fetch_xor(local, std::memory_order_relaxed);
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) != kThreads) {}
+    const auto t0 = std::chrono::steady_clock::now();
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) thread.join();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    const long long total_pairs =
+        static_cast<long long>(kThreads) * kPairsPerThread;
+    long long summed_thread_ns = 0;
+    for (long long duration : thread_ns) summed_thread_ns += duration;
+    std::fprintf(stderr, "  aggregate throughput: %.1f ns/pair (%lld total pairs)\n",
+                 static_cast<double>(elapsed) / total_pairs, total_pairs);
+    std::fprintf(stderr, "  mean thread latency:  %.1f ns/pair\n",
+                 static_cast<double>(summed_thread_ns) / total_pairs);
+    std::fprintf(stderr, "  checksum: %zu\n",
+                 static_cast<size_t>(checksum.load(std::memory_order_relaxed)));
+}
+
 static void benchmark() {
     std::fprintf(stderr, "\n[ BENCH ] alloc/free hot loop, fixed 64B, 2M iters\n");
     constexpr int N = 2'000'000;
@@ -157,22 +279,12 @@ static void benchmark() {
         auto t0 = clk::now();
         for (int i = 0; i < N; ++i) {
             void* p = a.allocate(64);
+            keep_pointer_observable(p);
             a.deallocate(p);
         }
         auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
                       clk::now() - t0).count();
         std::fprintf(stderr, "  arena : %lld ns total, %.1f ns/op\n",
-                     static_cast<long long>(dt), double(dt) / N);
-    }
-    {
-        auto t0 = clk::now();
-        for (int i = 0; i < N; ++i) {
-            void* p = std::malloc(64);
-            std::free(p);
-        }
-        auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      clk::now() - t0).count();
-        std::fprintf(stderr, "  malloc: %lld ns total, %.1f ns/op\n",
                      static_cast<long long>(dt), double(dt) / N);
     }
 }
@@ -187,9 +299,12 @@ int main() {
     test_usable_size();
     test_stats();
     test_deallocate_all();
+    test_concurrent_cross_thread_free();
+    test_concurrent_realloc();
 
     std::fprintf(stderr, "\n%s\n", failures == 0 ? "all tests passed" : "TESTS FAILED");
 
     benchmark();
+    benchmark_concurrent();
     return failures == 0 ? 0 : 1;
 }

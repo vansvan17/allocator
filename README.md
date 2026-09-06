@@ -1,109 +1,53 @@
-# First-Fit Free-List Arena Allocator
+# Arena allocator
 
-A custom heap allocator in C++ that requests memory directly from the
-kernel via `mmap(2)`, manages it with an intrusive doubly-linked free list,
-and uses boundary-tag coalescing to prevent fragmentation.
+A C++20 allocator backed by `mmap`. The single-threaded implementation uses
+boundary tags and an intrusive first-fit free list. `ConcurrentAllocator`
+adds a sharded concurrency layer without putting one lock around the entire
+heap.
 
-> **Status:** correctness validated under AddressSanitizer; ~17 ns per
-> alloc/free cycle (64 B blocks, hot loop, single-threaded).
+## Concurrent design
 
-## What this demonstrates
+- Threads are assigned to one of 32 cache-line-aligned shards.
+- Each shard owns an independent arena allocator and an `atomic_flag` lock.
+- An 8-byte prefix records the owning shard for every allocation.
+- A block can therefore be freed by a thread other than the one that
+  allocated it.
 
-- **Kernel-managed memory:** uses `mmap` with `MAP_PRIVATE | MAP_ANONYMOUS`
-  to obtain page-aligned, zero-filled memory regions ("arenas") of 1 MiB
-  by default. No dependency on `malloc`/`brk`/`sbrk`.
-- **In-band metadata:** every allocated block carries a header (and a
-  footer for boundary-tag walks) holding its size and flags. The user
-  pointer returned by `allocate()` skips past the header; `deallocate()`
-  recovers the header by subtracting the header size.
-- **Bitwise alignment:** all sizes are stored with the low 3 bits reserved
-  for flags. Because every block size is a multiple of 8, those bits are
-  always zero in the "real size" and free for tagging. `bit 0 = is_free`.
-- **Boundary-tag coalescing:** on `deallocate()`, we walk to the next block
-  via pointer arithmetic and to the previous block via the previous
-  footer. Adjacent free blocks merge in O(1), preventing fragmentation
-  without a separate compaction pass.
-- **Lazy arena growth:** when the free list has no block large enough, a
-  new arena is `mmap`'d and laid down as one giant free block.
-- **realloc support:** extends in place when the next block is free and
-  large enough; otherwise falls back to allocate-copy-free.
-- **Memory introspection:** `stats()` reports arena count, mapped/allocated/
-  free bytes, and allocation count. `usable_size()` queries the usable
-  payload size of any live allocation.
-- **Bulk reset:** `deallocate_all()` reconstitutes each arena as a single
-  free block, enabling fast reuse without individual frees.
+The design is concurrent, not lock-free. An operation can wait for another
+operation on the same shard, but unrelated shards do not contend. The prefix
+costs 8 bytes per allocation and the default configuration maps one 1 MiB
+arena per shard.
 
-## Block layout
+## Build and test
 
-```
- ┌──────────┬─────────────────────────┬──────────┐
- │  Header  │       Payload (n B)     │  Footer  │
- │  (size,  │  user pointer points    │  (size,  │
- │   flags) │  to start of payload    │   flags) │
- └──────────┴─────────────────────────┴──────────┘
+```sh
+make test
+make sanitize
+make tsan
 ```
 
-When a block is free, its first 16 bytes of payload are reused as the
-doubly-linked free-list pointers (prev/next). This is safe because no
-user pointer can be live for a free block.
-
-## Build & test
-
-```bash
-g++ -O2 -std=c++17 -Wall -Wextra test_allocator.cpp -o test_alloc
-./test_alloc
-```
-
-ASan + UBSan run:
-
-```bash
-g++ -O1 -g -std=c++17 -fsanitize=address,undefined test_allocator.cpp -o test_alloc_asan
-./test_alloc_asan
-```
-
-## Test results
-
-```
-[ RUN ] basic_alloc_free               OK
-[ RUN ] alignment                      OK    (200 sizes, every payload 8-byte aligned)
-[ RUN ] many_allocs_no_corruption      OK    (2,000 live allocs, byte-fill checksums)
-[ RUN ] coalescing                     OK    (free middle+right+left, then allocate
-                                              larger-than-any-single-block — succeeds)
-[ RUN ] arena_growth                   OK    (100 × 1 KiB allocs in 4 KiB arenas →
-                                              multiple arenas chained)
-[ RUN ] realloc                        OK    (grow, shrink, null-pointer semantics)
-[ RUN ] usable_size                    OK    (reports >= requested payload)
-[ RUN ] stats                          OK    (arena count, mapped/allocated bytes)
-[ RUN ] deallocate_all                 OK    (bulk reset, then large alloc succeeds)
-```
-
-ASan: clean across all tests.
+The tests cover splitting, coalescing, arena growth, `realloc`, alignment,
+and concurrent allocation with cross-thread frees. AddressSanitizer,
+UndefinedBehaviorSanitizer, and ThreadSanitizer pass locally.
 
 ## Benchmark
 
-Single-threaded alloc/free of 64 B blocks, 2 M iterations, x86-64:
+Workload: 16 threads, 500,000 fixed-size 64-byte allocate/free pairs per
+thread, Apple Silicon, `-O2`. Each thread warms its shard before the timed
+region.
 
-| Allocator | ns/op |
-|---|---|
-| arena (this project) | **17.2** |
-| glibc `malloc`       | <1 (the hot loop optimizes away; not directly comparable) |
+| Measurement | Result |
+| --- | ---: |
+| Median mean-thread latency (10 runs) | **21.0 ns/pair** |
+| Range | 18.0–27.4 ns/pair |
 
-The glibc number is misleadingly fast: under `-O2`, the compiler+glibc
-recognize the repeated same-size alloc/free pattern and serve from a
-thread-local fast bin without ever touching the global heap. A more
-honest comparison would interleave allocations of different sizes and
-hold a working set live — left for future work.
+The reported latency is the sum of each thread's timed duration divided by
+the total number of pairs. The test also prints aggregate wall-clock
+throughput separately; the two values should not be confused.
 
-## Known limitations
+## Limits
 
-- **Not thread-safe.** A real production allocator (e.g. tcmalloc,
-  jemalloc) maintains per-thread caches to avoid synchronization on the
-  hot path. This project deliberately keeps that out of scope; the
-  companion MPMC queue covers concurrency.
-- **First-fit, not best-fit or segregated.** Best-fit reduces wasted space
-  but costs more per allocation. Segregated free lists (one per size
-  class) are what production allocators use. First-fit is the simplest
-  correct strategy and a good starting point.
-- **Whole arenas, no return-to-OS.** Once an arena is `mmap`'d, it's never
-  `munmap`'d until destruction. A real allocator would `madvise(MADV_DONTNEED)`
-  fully-free pages.
+- First-fit search is linear in the number of free blocks.
+- Arenas are released at allocator destruction, not returned piecemeal.
+- Shard assignment is optimized for a long-lived shared allocator. More than
+  32 active threads can share shards and contend.

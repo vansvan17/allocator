@@ -9,10 +9,13 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <thread>
 
 namespace arena {
 
@@ -298,6 +301,132 @@ private:
     FreeNode* free_head_     = nullptr;
     size_t    alloc_count_   = 0;
     size_t    total_mapped_  = 0;
+};
+
+// A shared allocator built from independent arenas. Threads are assigned a
+// shard for allocation; the shard id stored before each returned pointer lets
+// another thread return the block to the correct arena.
+class ConcurrentAllocator {
+public:
+    static constexpr size_t kShardCount = 32;
+
+    ConcurrentAllocator() = default;
+
+    ConcurrentAllocator(const ConcurrentAllocator&) = delete;
+    ConcurrentAllocator& operator=(const ConcurrentAllocator&) = delete;
+
+    void* allocate(size_t n) {
+        if (n == 0) return nullptr;
+        const size_t shard_id = local_shard();
+        Shard& shard = shards_[shard_id];
+        LockGuard guard(shard.lock);
+        auto* raw = static_cast<unsigned char*>(
+            shard.allocator.allocate(n + sizeof(AllocationPrefix)));
+        auto* prefix = reinterpret_cast<AllocationPrefix*>(raw);
+        prefix->shard = static_cast<std::uint32_t>(shard_id);
+        prefix->magic = kPrefixMagic;
+        return raw + sizeof(AllocationPrefix);
+    }
+
+    void deallocate(void* p) {
+        if (!p) return;
+        auto* raw = static_cast<unsigned char*>(p) - sizeof(AllocationPrefix);
+        auto* prefix = reinterpret_cast<AllocationPrefix*>(raw);
+        assert(prefix->magic == kPrefixMagic);
+        assert(prefix->shard < kShardCount);
+        Shard& shard = shards_[prefix->shard];
+        LockGuard guard(shard.lock);
+        shard.allocator.deallocate(raw);
+    }
+
+    void* realloc(void* p, size_t n) {
+        if (!p) return allocate(n);
+        if (n == 0) {
+            deallocate(p);
+            return nullptr;
+        }
+
+        auto* raw = static_cast<unsigned char*>(p) - sizeof(AllocationPrefix);
+        auto* prefix = reinterpret_cast<AllocationPrefix*>(raw);
+        assert(prefix->magic == kPrefixMagic);
+        assert(prefix->shard < kShardCount);
+        const std::uint32_t shard_id = prefix->shard;
+        Shard& shard = shards_[shard_id];
+        LockGuard guard(shard.lock);
+        auto* new_raw = static_cast<unsigned char*>(
+            shard.allocator.realloc(raw, n + sizeof(AllocationPrefix)));
+        auto* new_prefix = reinterpret_cast<AllocationPrefix*>(new_raw);
+        new_prefix->shard = shard_id;
+        new_prefix->magic = kPrefixMagic;
+        return new_raw + sizeof(AllocationPrefix);
+    }
+
+    size_t usable_size(void* p) {
+        if (!p) return 0;
+        auto* raw = static_cast<unsigned char*>(p) - sizeof(AllocationPrefix);
+        auto* prefix = reinterpret_cast<AllocationPrefix*>(raw);
+        assert(prefix->magic == kPrefixMagic);
+        Shard& shard = shards_[prefix->shard];
+        LockGuard guard(shard.lock);
+        return shard.allocator.usable_size(raw) - sizeof(AllocationPrefix);
+    }
+
+private:
+    class SpinLock {
+    public:
+        void lock() {
+            unsigned spins = 0;
+            while (flag_.test_and_set(std::memory_order_acquire)) {
+                if (++spins == 64) {
+                    spins = 0;
+                    std::this_thread::yield();
+                }
+            }
+        }
+
+        void unlock() { flag_.clear(std::memory_order_release); }
+
+    private:
+        std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+    };
+
+    class LockGuard {
+    public:
+        explicit LockGuard(SpinLock& lock) : lock_(lock) { lock_.lock(); }
+        ~LockGuard() { lock_.unlock(); }
+
+    private:
+        SpinLock& lock_;
+    };
+
+    struct alignas(64) Shard {
+        SpinLock lock;
+        Allocator allocator;
+    };
+
+    struct AllocationPrefix {
+        std::uint32_t shard;
+        std::uint32_t magic;
+    };
+
+    static constexpr std::uint32_t kPrefixMagic = 0xA110CA7E;
+
+    size_t local_shard() {
+        struct Binding {
+            const ConcurrentAllocator* owner = nullptr;
+            size_t shard = 0;
+        };
+        static thread_local Binding binding;
+        if (binding.owner != this) {
+            binding.owner = this;
+            binding.shard = next_shard_.fetch_add(1, std::memory_order_relaxed) %
+                            kShardCount;
+        }
+        return binding.shard;
+    }
+
+    std::array<Shard, kShardCount> shards_;
+    std::atomic<size_t> next_shard_{0};
 };
 
 } // namespace arena
