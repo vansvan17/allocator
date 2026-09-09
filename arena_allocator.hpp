@@ -1,8 +1,3 @@
-// arena_allocator.hpp — First-fit free-list arena allocator.
-//
-// Design: mmap'd arenas, boundary-tag coalescing, in-band flags in low 3 bits.
-// Single-threaded. No libc malloc dependency.
-
 #pragma once
 
 #include <sys/mman.h>
@@ -19,7 +14,6 @@
 
 namespace arena {
 
-// Every block payload is 8-byte aligned. Low 3 bits of size fields = flags.
 constexpr size_t kAlignment  = 8;
 constexpr size_t kFlagFree   = 0x1;
 constexpr size_t kSizeMask   = ~(kAlignment - 1);
@@ -28,8 +22,6 @@ inline constexpr size_t align_up(size_t n) {
     return (n + kAlignment - 1) & kSizeMask;
 }
 
-// Each block has a header (size|flags) and footer (size|flags) for O(1)
-// coalescing. Free blocks reuse payload space for free-list links.
 struct BlockHeader {
     size_t size_and_flags;
 
@@ -55,7 +47,6 @@ constexpr size_t kFooterSize  = sizeof(BlockFooter);
 constexpr size_t kOverhead    = kHeaderSize + kFooterSize;
 constexpr size_t kMinBlockSize = align_up(sizeof(FreeNode) + kFooterSize);
 
-// ─── Pointer helpers ────────────────────────────────────────────────────
 inline BlockFooter* footer_of(BlockHeader* h) {
     return reinterpret_cast<BlockFooter*>(reinterpret_cast<char*>(h) + h->size() - kFooterSize);
 }
@@ -303,9 +294,6 @@ private:
     size_t    total_mapped_  = 0;
 };
 
-// A shared allocator built from independent arenas. Threads are assigned a
-// shard for allocation; the shard id stored before each returned pointer lets
-// another thread return the block to the correct arena.
 class ConcurrentAllocator {
 public:
     static constexpr size_t kShardCount = 32;
@@ -429,4 +417,4 @@ private:
     std::atomic<size_t> next_shard_{0};
 };
 
-} // namespace arena
+}

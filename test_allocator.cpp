@@ -1,5 +1,3 @@
-// test_allocator.cpp — Functional and performance smoke tests.
-
 #include "arena_allocator.hpp"
 
 #include <chrono>
@@ -13,7 +11,7 @@
 using arena::Allocator;
 using arena::ConcurrentAllocator;
 
-static int failures = 0;
+static std::atomic<int> failures{0};
 
 static inline void keep_pointer_observable(void* p) {
     asm volatile("" : : "g"(p) : "memory");
@@ -112,9 +110,6 @@ static void test_realloc() {
     EXPECT(shrink == z);
 
     a.deallocate(shrink);
-    // deallocate(nullptr) is required to be a no-op.  It returns void, so
-    // calling it directly is the only meaningful assertion here: the test
-    // passes if it does not crash.
     a.deallocate(nullptr);
 }
 
@@ -181,7 +176,6 @@ static void test_concurrent_cross_thread_free() {
     for (auto& thread : threads) thread.join();
     threads.clear();
 
-    // Each thread frees blocks created by a different thread.
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             const int source = (t + 1) % kThreads;
@@ -229,7 +223,6 @@ static void benchmark_concurrent() {
 
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
-            // Warm the thread's shard before starting the clock.
             void* warmup = allocator.allocate(64);
             allocator.deallocate(warmup);
             ready.fetch_add(1, std::memory_order_release);
@@ -242,12 +235,13 @@ static void benchmark_concurrent() {
                 keep_pointer_observable(p);
                 static_cast<unsigned char*>(p)[0] =
                     static_cast<unsigned char>(i);
-                local ^= reinterpret_cast<std::uintptr_t>(p);
+                local += reinterpret_cast<std::uintptr_t>(p) ^
+                         static_cast<std::uintptr_t>(i);
                 allocator.deallocate(p);
             }
             thread_ns[t] = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - thread_start).count();
-            checksum.fetch_xor(local, std::memory_order_relaxed);
+            checksum.fetch_add(local, std::memory_order_relaxed);
         });
     }
 
@@ -302,9 +296,11 @@ int main() {
     test_concurrent_cross_thread_free();
     test_concurrent_realloc();
 
-    std::fprintf(stderr, "\n%s\n", failures == 0 ? "all tests passed" : "TESTS FAILED");
+    const int failure_count = failures.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "\n%s\n",
+                 failure_count == 0 ? "all tests passed" : "TESTS FAILED");
 
     benchmark();
     benchmark_concurrent();
-    return failures == 0 ? 0 : 1;
+    return failure_count == 0 ? 0 : 1;
 }

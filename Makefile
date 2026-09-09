@@ -4,14 +4,11 @@ CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
 .PHONY: test sanitize tsan clean
 
 test: build/test_allocator
+	./build/test_allocator
 
 build/test_allocator: test_allocator.cpp arena_allocator.hpp
-
 	mkdir -p build
-
 	$(CXX) $(CXXFLAGS) test_allocator.cpp -o $@
-
-	./$@
 
 sanitize:
 	$(MAKE) clean

@@ -33,13 +33,13 @@ UndefinedBehaviorSanitizer, and ThreadSanitizer pass locally.
 ## Benchmark
 
 Workload: 16 threads, 500,000 fixed-size 64-byte allocate/free pairs per
-thread, Apple Silicon, `-O2`. Each thread warms its shard before the timed
-region.
+thread, 10-core Apple M5, Apple Clang 21, `-O2`. Each thread warms its shard
+before the timed region.
 
 | Measurement | Result |
 | --- | ---: |
-| Median mean-thread latency (10 runs) | **21.0 ns/pair** |
-| Range | 18.0–27.4 ns/pair |
+| Median mean-thread latency (10 runs) | **19.7 ns/pair** |
+| Range | 14.1–30.1 ns/pair |
 
 The reported latency is the sum of each thread's timed duration divided by
 the total number of pairs. The test also prints aggregate wall-clock
