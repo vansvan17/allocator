@@ -41,9 +41,9 @@ before the timed region.
 | Median mean-thread latency (10 runs) | **19.7 ns/pair** |
 | Range | 14.1–30.1 ns/pair |
 
-The reported latency is the sum of each thread's timed duration divided by
-the total number of pairs. The test also prints aggregate wall-clock
-throughput separately; the two values should not be confused.
+Latency is the sum of each thread's timed duration divided by the total
+number of pairs. The test also prints aggregate wall-clock throughput, which
+is a different number.
 
 ## Limits
 
